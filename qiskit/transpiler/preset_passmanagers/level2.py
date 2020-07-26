@@ -18,18 +18,26 @@ Level 2 pass manager: medium optimization by noise adaptive qubit mapping and
 gate cancellation using commutativity rules.
 """
 
-from qiskit.transpiler.pass_manager_config import PassManagerConfig
+from qiskit.transpiler.passmanager_config import PassManagerConfig
 from qiskit.transpiler.passmanager import PassManager
 
 from qiskit.transpiler.passes import Unroller
+from qiskit.transpiler.passes import BasisTranslator
+from qiskit.transpiler.passes import UnrollCustomDefinitions
 from qiskit.transpiler.passes import Unroll3qOrMore
 from qiskit.transpiler.passes import CheckMap
 from qiskit.transpiler.passes import CXDirection
 from qiskit.transpiler.passes import SetLayout
-from qiskit.transpiler.passes import DenseLayout
 from qiskit.transpiler.passes import CSPLayout
+from qiskit.transpiler.passes import TrivialLayout
+from qiskit.transpiler.passes import DenseLayout
+from qiskit.transpiler.passes import NoiseAdaptiveLayout
+from qiskit.transpiler.passes import SabreLayout
 from qiskit.transpiler.passes import BarrierBeforeFinalMeasurements
+from qiskit.transpiler.passes import BasicSwap
+from qiskit.transpiler.passes import LookaheadSwap
 from qiskit.transpiler.passes import StochasticSwap
+from qiskit.transpiler.passes import SabreSwap
 from qiskit.transpiler.passes import FullAncillaAllocation
 from qiskit.transpiler.passes import EnlargeWithAncilla
 from qiskit.transpiler.passes import FixedPoint
@@ -39,6 +47,8 @@ from qiskit.transpiler.passes import Optimize1qGates
 from qiskit.transpiler.passes import CommutativeCancellation
 from qiskit.transpiler.passes import ApplyLayout
 from qiskit.transpiler.passes import CheckCXDirection
+
+from qiskit.transpiler import TranspilerError
 
 
 def level_2_pass_manager(pass_manager_config: PassManagerConfig) -> PassManager:
@@ -64,10 +74,16 @@ def level_2_pass_manager(pass_manager_config: PassManagerConfig) -> PassManager:
 
     Returns:
         a level 2 pass manager.
+
+    Raises:
+        TranspilerError: if the passmanager config is invalid.
     """
     basis_gates = pass_manager_config.basis_gates
     coupling_map = pass_manager_config.coupling_map
     initial_layout = pass_manager_config.initial_layout
+    layout_method = pass_manager_config.layout_method or 'dense'
+    routing_method = pass_manager_config.routing_method or 'stochastic'
+    translation_method = pass_manager_config.translation_method or 'translator'
     seed_transpiler = pass_manager_config.seed_transpiler
     backend_properties = pass_manager_config.backend_properties
 
@@ -78,7 +94,16 @@ def level_2_pass_manager(pass_manager_config: PassManagerConfig) -> PassManager:
         return not property_set['layout']
 
     _choose_layout_1 = CSPLayout(coupling_map, call_limit=1000, time_limit=10)
-    _choose_layout_2 = DenseLayout(coupling_map, backend_properties)
+    if layout_method == 'trivial':
+        _choose_layout_2 = TrivialLayout(coupling_map)
+    elif layout_method == 'dense':
+        _choose_layout_2 = DenseLayout(coupling_map, backend_properties)
+    elif layout_method == 'noise_adaptive':
+        _choose_layout_2 = NoiseAdaptiveLayout(backend_properties)
+    elif layout_method == 'sabre':
+        _choose_layout_2 = SabreLayout(coupling_map, max_iterations=2, seed=seed_transpiler)
+    else:
+        raise TranspilerError("Invalid layout method %s." % layout_method)
 
     # 2. Extend dag/layout with ancillas using the full coupling map
     _embed = [FullAncillaAllocation(coupling_map), EnlargeWithAncilla(), ApplyLayout()]
@@ -92,11 +117,27 @@ def level_2_pass_manager(pass_manager_config: PassManagerConfig) -> PassManager:
     def _swap_condition(property_set):
         return not property_set['is_swap_mapped']
 
-    _swap = [BarrierBeforeFinalMeasurements(),
-             StochasticSwap(coupling_map, trials=20, seed=seed_transpiler)]
+    _swap = [BarrierBeforeFinalMeasurements()]
+    if routing_method == 'basic':
+        _swap += [BasicSwap(coupling_map)]
+    elif routing_method == 'stochastic':
+        _swap += [StochasticSwap(coupling_map, trials=20, seed=seed_transpiler)]
+    elif routing_method == 'lookahead':
+        _swap += [LookaheadSwap(coupling_map, search_depth=5, search_width=5)]
+    elif routing_method == 'sabre':
+        _swap += [SabreSwap(coupling_map, heuristic='decay', seed=seed_transpiler)]
+    else:
+        raise TranspilerError("Invalid routing method %s." % routing_method)
 
     # 5. Unroll to the basis
-    _unroll = Unroller(basis_gates)
+    if translation_method == 'unroller':
+        _unroll = [Unroller(basis_gates)]
+    elif translation_method == 'translator':
+        from qiskit.circuit.equivalence_library import SessionEquivalenceLibrary as sel
+        _unroll = [UnrollCustomDefinitions(sel, basis_gates),
+                   BasisTranslator(sel, basis_gates)]
+    else:
+        raise TranspilerError("Invalid translation method %s." % translation_method)
 
     # 6. Fix any bad CX directions
     _direction_check = [CheckCXDirection(coupling_map)]
@@ -115,7 +156,7 @@ def level_2_pass_manager(pass_manager_config: PassManagerConfig) -> PassManager:
     def _opt_control(property_set):
         return not property_set['depth_fixed_point']
 
-    _opt = [Optimize1qGates(), CommutativeCancellation()]
+    _opt = [Optimize1qGates(basis_gates), CommutativeCancellation()]
 
     # Build pass manager
     pm2 = PassManager()

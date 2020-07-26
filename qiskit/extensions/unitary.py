@@ -19,11 +19,12 @@ Arbitrary unitary circuit instruction.
 from collections import OrderedDict
 import numpy
 
-from qiskit.circuit import Gate
+from qiskit.circuit import Gate, ControlledGate
 from qiskit.circuit import QuantumCircuit
 from qiskit.circuit import QuantumRegister
-from qiskit.exceptions import QiskitError
-from qiskit.extensions.standard import U3Gate
+from qiskit.circuit._utils import _compute_control_matrix
+from qiskit.circuit.library.standard_gates import U3Gate
+from qiskit.extensions.quantum_initializer import isometry
 from qiskit.quantum_info.operators.predicates import matrix_equal
 from qiskit.quantum_info.operators.predicates import is_unitary_matrix
 from qiskit.quantum_info.synthesis.one_qubit_decompose import OneQubitEulerDecomposer
@@ -62,8 +63,8 @@ class UnitaryGate(Gate):
             raise ExtensionError("Input matrix is not unitary.")
         # Check input is N-qubit matrix
         input_dim, output_dim = data.shape
-        n_qubits = int(numpy.log2(input_dim))
-        if input_dim != output_dim or 2**n_qubits != input_dim:
+        num_qubits = int(numpy.log2(input_dim))
+        if input_dim != output_dim or 2**num_qubits != input_dim:
             raise ExtensionError(
                 "Input matrix is not an N-qubit operator.")
 
@@ -71,7 +72,7 @@ class UnitaryGate(Gate):
         self._qasm_definition = None
         self._qasm_def_written = False
         # Store instruction params
-        super().__init__('unitary', n_qubits, [data], label=label)
+        super().__init__('unitary', num_qubits, [data], label=label)
 
     def __eq__(self, other):
         if not isinstance(other, UnitaryGate):
@@ -106,13 +107,17 @@ class UnitaryGate(Gate):
         """Calculate a subcircuit that implements this unitary."""
         if self.num_qubits == 1:
             q = QuantumRegister(1, "q")
+            qc = QuantumCircuit(q, name=self.name)
             theta, phi, lam = _DECOMPOSER1Q.angles(self.to_matrix())
-            self.definition = [(U3Gate(theta, phi, lam), [q[0]], [])]
+            qc._append(U3Gate(theta, phi, lam), [q[0]], [])
+            self.definition = qc
         elif self.num_qubits == 2:
             self.definition = two_qubit_cnot_decompose(self.to_matrix())
         else:
-            raise NotImplementedError("Not able to generate a subcircuit for "
-                                      "a {}-qubit unitary".format(self.num_qubits))
+            q = QuantumRegister(self.num_qubits, "q")
+            qc = QuantumCircuit(q, name=self.name)
+            qc.append(isometry.Isometry(self.to_matrix(), 0, 0), qargs=q[:])
+            self.definition = qc
 
     def control(self, num_ctrl_qubits=1, label=None, ctrl_state=None):
         r"""Return controlled version of gate
@@ -127,10 +132,29 @@ class UnitaryGate(Gate):
             UnitaryGate: controlled version of gate.
 
         Raises:
-            QiskitError: invalid ctrl_state
+            QiskitError: Invalid ctrl_state.
+            ExtensionError: Non-unitary controlled unitary.
         """
-        cmat = _compute_control_matrix(self.to_matrix(), num_ctrl_qubits)
-        return UnitaryGate(cmat, label=label)
+        cmat = _compute_control_matrix(self.to_matrix(), num_ctrl_qubits, ctrl_state=ctrl_state)
+        iso = isometry.Isometry(cmat, 0, 0)
+        cunitary = ControlledGate('c-unitary', num_qubits=self.num_qubits+num_ctrl_qubits,
+                                  params=[cmat], label=label, num_ctrl_qubits=num_ctrl_qubits,
+                                  definition=iso.definition, ctrl_state=ctrl_state)
+
+        from qiskit.quantum_info import Operator
+        # hack to correct global phase; should fix to prevent need for correction here
+        pmat = (Operator(iso.inverse()).data @ cmat)
+        diag = numpy.diag(pmat)
+        if not numpy.allclose(diag, diag[0]):
+            raise ExtensionError('controlled unitary generation failed')
+        phase = numpy.angle(diag[0])
+        if phase:
+            qreg = cunitary.definition.qregs[0]
+            cunitary.definition.u3(numpy.pi, phase, phase - numpy.pi, qreg[0])
+            cunitary.definition.u3(numpy.pi, 0, numpy.pi, qreg[0])
+        cunitary.base_gate = self.copy()
+        cunitary.base_gate.label = self.label
+        return cunitary
 
     def qasm(self):
         """ The qasm for a custom unitary gate
@@ -158,7 +182,7 @@ class UnitaryGate(Gate):
         current_reg = 0
 
         gates_def = ""
-        for gate in self.definition:
+        for gate in self.definition.data:
 
             # add regs from this gate to the overall set of params
             for reg in gate[1] + gate[2]:
@@ -182,54 +206,8 @@ class UnitaryGate(Gate):
         return self._qasm_definition + self._qasmif(self._qasm_name)
 
 
-def _compute_control_matrix(base_mat, num_ctrl_qubits, ctrl_state=None):
-    r"""
-    Compute the controlled version of the input matrix with qiskit ordering.
-    This function computes the controlled unitary with :math:`n` control qubits
-    and :math:`m` target qubits,
-
-    .. math::
-
-        V_n^j(U_{2^m}) = (U_{2^m} \otimes |j\rangle\!\langle j|) +
-                         (I_{2^m} \otimes (I_{2^n} - |j\rangle\!\langle j|)).
-
-    where :math:`|j\rangle \in \mathcal{H}^{2^n}` is the control state.
-
-    Args:
-        base_mat (ndarray): unitary to be controlled
-        num_ctrl_qubits (int): number of controls for new unitary
-        ctrl_state (int or str or None): The control state in decimal or as
-            a bitstring (e.g. '111'). If None, use 2**num_ctrl_qubits-1.
-
-    Returns:
-        ndarray: controlled version of base matrix.
-
-    Raises:
-        QiskitError: unrecognized mode or invalid ctrl_state
-    """
-    num_target = int(numpy.log2(base_mat.shape[0]))
-    ctrl_dim = 2**num_ctrl_qubits
-    ctrl_grnd = numpy.repeat([[1], [0]], [1, ctrl_dim-1])
-    if ctrl_state is None:
-        ctrl_state = ctrl_dim - 1
-    elif isinstance(ctrl_state, str):
-        ctrl_state = int(ctrl_state, 2)
-    if isinstance(ctrl_state, int):
-        if not 0 <= ctrl_state < ctrl_dim:
-            raise QiskitError('Invalid control state value specified.')
-    else:
-        raise QiskitError('Invalid control state type specified.')
-    full_mat_dim = ctrl_dim * base_mat.shape[0]
-    full_mat = numpy.zeros((full_mat_dim, full_mat_dim), dtype=base_mat.dtype)
-    ctrl_proj = numpy.diag(numpy.roll(ctrl_grnd, ctrl_state))
-    full_mat = (numpy.kron(numpy.eye(2**num_target),
-                           numpy.eye(ctrl_dim) - ctrl_proj)
-                + numpy.kron(base_mat, ctrl_proj))
-    return full_mat
-
-
 def unitary(self, obj, qubits, label=None):
-    """Apply u2 to q."""
+    """Apply unitary gate to q."""
     if isinstance(qubits, QuantumRegister):
         qubits = qubits[:]
     return self.append(UnitaryGate(obj, label=label), qubits, [])

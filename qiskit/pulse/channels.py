@@ -12,8 +12,7 @@
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
 
-"""
-This module defines Pulse Channels. Channels include:
+"""This module defines Pulse Channels. Channels include:
 
   - transmit channels, which should subclass ``PulseChannel``
   - receive channels, such as ``AcquireChannel``
@@ -50,6 +49,7 @@ class Channel(metaclass=ABCMeta):
         if not isinstance(index, int) or index < 0:
             raise PulseError('Channel index must be a nonnegative integer')
         self._index = index
+        self._hash = None
 
     @property
     def index(self) -> int:
@@ -80,7 +80,9 @@ class Channel(metaclass=ABCMeta):
         return type(self) is type(other) and self._index == other._index
 
     def __hash__(self):
-        return hash((type(self), self._index))
+        if self._hash is None:
+            self._hash = hash((type(self), self._index))
+        return self._hash
 
 
 class PulseChannel(Channel, metaclass=ABCMeta):
@@ -112,7 +114,7 @@ class AcquireChannel(Channel):
 
 
 class SnapshotChannel(Channel):
-    """Snapshot channels are used to specify commands for simulators."""
+    """Snapshot channels are used to specify instructions for simulators."""
     prefix = 's'
 
     def __init__(self):

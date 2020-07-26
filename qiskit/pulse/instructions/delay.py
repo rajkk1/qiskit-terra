@@ -13,12 +13,9 @@
 # that they have been altered from the originals.
 
 """An instruction for blocking time on a channel; useful for scheduling alignment."""
-import warnings
+from typing import Optional
 
-from typing import List, Optional, Union
-
-from qiskit.pulse.channels import PulseChannel
-from qiskit.pulse.exceptions import PulseError
+from ..channels import Channel
 from .instruction import Instruction
 
 
@@ -39,7 +36,7 @@ class Delay(Instruction):
     """
 
     def __init__(self, duration: int,
-                 channel: Optional[PulseChannel] = None,
+                 channel: Channel,
                  name: Optional[str] = None):
         """Create a new delay instruction.
 
@@ -50,44 +47,12 @@ class Delay(Instruction):
             channel: The channel that will have the delay.
             name: Name of the delay for display purposes.
         """
-        if channel is None:
-            warnings.warn("Usage of Delay without specifying a channel is deprecated. For "
-                          "example, Delay(5)(DriveChannel(0)) should be replaced by "
-                          "Delay(5, DriveChannel(0)).", DeprecationWarning)
         self._channel = channel
-        super().__init__(duration, channel, name=name)
+        super().__init__((duration, channel), duration, (channel,), name=name)
 
     @property
-    def operands(self) -> List[Union[int, PulseChannel]]:
-        """Return a list of instruction operands."""
-        return [self.duration, self.channel]
-
-    @property
-    def channel(self) -> PulseChannel:
+    def channel(self) -> Channel:
         """Return the :py:class:`~qiskit.pulse.channels.Channel` that this instruction is
         scheduled on.
         """
         return self._channel
-
-    def __call__(self, channel: PulseChannel) -> 'Delay':
-        """Return new ``Delay`` that is fully instantiated with both ``duration`` and a ``channel``.
-
-        Args:
-            channel: The channel that will have the delay.
-
-        Return:
-            Complete and ready to schedule ``Delay``.
-
-        Raises:
-            PulseError: If ``channel`` has already been set.
-        """
-        warnings.warn("Calling Delay with a channel is deprecated. Instantiate the delay with "
-                      "a channel instead.", DeprecationWarning)
-        if self._channel is not None:
-            raise PulseError("The channel has already been assigned as {}.".format(self.channel))
-        return Delay(self.duration, channel)
-
-    def __repr__(self):
-        return "{}({}, {})".format(self.__class__.__name__,
-                                   self.duration,
-                                   self.channel)
